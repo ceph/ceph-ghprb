@@ -1,0 +1,171 @@
+# Automatic PR lifecycle dispatcher.
+#
+# This workflow handles:
+# - PR opened
+# - PR reopened
+# - PR synchronize / force-push / new commits
+# - PR closed cleanup
+#
+# Important security rule:
+# This workflow uses pull_request_target, so it must remain metadata-only.
+# Do not checkout PR code.
+# Do not execute files/scripts from the PR branch.
+# Only read PR metadata and call GitHub/Jenkins APIs.
+#
+# Behavior:
+# - Skip Jenkins triggers if PR title contains [skip ci].
+# - Automatically trigger Jenkins only if PR author is a Ceph org member.
+# - For non-member PR authors, add a comment explaining ok to test.
+# - On PR close, abort running Jenkins jobs for this PR without starting a new job.
+
+name: Pull Request Job Dispatcher POC
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, closed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+  issues: write
+
+concurrency:
+  group: pr-job-dispatch-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-info:
+    runs-on: ubuntu-latest
+
+    outputs:
+      pr_number: ${{ steps.meta.outputs.pr_number }}
+      pr_sha: ${{ steps.meta.outputs.pr_sha }}
+      action: ${{ steps.meta.outputs.action }}
+      skip_ci: ${{ steps.meta.outputs.skip_ci }}
+      is_ceph_member: ${{ steps.member.outputs.is_ceph_member }}
+
+    steps:
+      - name: Capture PR metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          title='${{ github.event.pull_request.title }}'
+
+          echo "pr_number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          echo "pr_sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          echo "action=${{ github.event.action }}" >> "$GITHUB_OUTPUT"
+
+          if echo "$title" | grep -qi '\[skip ci\]'; then
+            echo "skip_ci=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_ci=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if PR author is Ceph org member
+        id: member
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          author='${{ github.event.pull_request.user.login }}'
+
+          status=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.CEPH_ORG_READ_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/orgs/ceph/members/$author")
+
+          if [[ "$status" == "204" ]]; then
+            echo "is_ceph_member=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_ceph_member=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Show PR decision inputs
+        shell: bash
+        run: |
+          echo "action=${{ steps.meta.outputs.action }}"
+          echo "skip_ci=${{ steps.meta.outputs.skip_ci }}"
+          echo "is_ceph_member=${{ steps.member.outputs.is_ceph_member }}"
+
+  comment-for-non-member:
+    needs: pr-info
+    if: |
+      needs.pr-info.outputs.action != 'closed' &&
+      needs.pr-info.outputs.skip_ci != 'true' &&
+      needs.pr-info.outputs.is_ceph_member != 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Add non-member CI notice comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.pr-info.outputs.pr_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          marker="<!-- ceph-ci-non-member-notice -->"
+
+          existing=$(curl -sS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
+            | jq -r '.[].body')
+
+          if echo "$existing" | grep -q "$marker"; then
+            echo "Non-member CI notice already exists. Skipping duplicate comment."
+            exit 0
+          fi
+
+          body=$(jq -n \
+            --arg marker "$marker" \
+            --arg text 'Thank you for your contribution. Since you, the author, are not a member of the Ceph GitHub Org yet, our CI will not automatically run. Any member of the Ceph Org may comment "ok to test" to allow the Jenkins jobs to run.' \
+            '{body: ($text + "\n\n" + $marker)}')
+
+          curl --fail -L \
+            -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
+            -d "$body"
+
+  trigger-poc:
+    needs: pr-info
+    if: |
+      needs.pr-info.outputs.action != 'closed' &&
+      needs.pr-info.outputs.skip_ci != 'true' &&
+      needs.pr-info.outputs.is_ceph_member == 'true'
+    uses: ./.github/workflows/dispatch-jenkins-job.yml
+    secrets: inherit
+    with:
+      pr_number: ${{ needs.pr-info.outputs.pr_number }}
+      pr_sha: ${{ needs.pr-info.outputs.pr_sha }}
+      jenkins_job: preserve-ceph-pr-trigger-poc
+      status_context: jenkins poc test
+      trigger_method: PR ${{ needs.pr-info.outputs.action }}
+      triggered_by: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      dry_run: false
+      post_pending_status: true
+      cancel_only: false
+      cancel_mode: stale
+
+  abort-on-close:
+    needs: pr-info
+    if: needs.pr-info.outputs.action == 'closed'
+    uses: ./.github/workflows/dispatch-jenkins-job.yml
+    secrets: inherit
+    with:
+      pr_number: ${{ needs.pr-info.outputs.pr_number }}
+      pr_sha: ${{ needs.pr-info.outputs.pr_sha }}
+      jenkins_job: preserve-ceph-pr-trigger-poc
+      status_context: jenkins poc test
+      trigger_method: PR closed
+      triggered_by: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      dry_run: false
+      post_pending_status: false
+      cancel_only: true
+      cancel_mode: all
