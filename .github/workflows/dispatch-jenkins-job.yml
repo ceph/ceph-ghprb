@@ -268,20 +268,26 @@ jobs:
           for attempt in 1 2 3 4 5; do
             echo "Triggering Jenkins job '$JENKINS_JOB' attempt $attempt..."
 
-            if curl --fail --silent --show-error --retry 4 --retry-delay 5 --retry-connrefused \
+            curl_exit=0
+
+            curl --fail --silent --show-error --retry 4 --retry-delay 5 --retry-connrefused \
               "${auth_args[@]}" \
               -X POST \
               "$JENKINS_BASE_URL/job/$JENKINS_JOB/buildWithParameters" \
               --data-urlencode "GH_PULL_REQUEST_ID=$PR_NUMBER" \
               --data-urlencode "GH_PULL_REQUEST_SHA=$PR_SHA" \
+              --data-urlencode "GITHUB_REPOSITORY=$REPO" \
+              --data-urlencode "STATUS_CONTEXT=$STATUS_CONTEXT" \
               --data-urlencode "TRIGGER_METHOD=$TRIGGER_METHOD" \
-              --data-urlencode "TRIGGERED_BY=$TRIGGERED_BY"; then
+              --data-urlencode "TRIGGERED_BY=$TRIGGERED_BY" || curl_exit=$?
+
+            if [[ "$curl_exit" == "0" ]]; then
               success=true
               echo "Jenkins job '$JENKINS_JOB' triggered successfully."
               break
             fi
 
-            echo "Attempt $attempt failed. Retrying in 5s..."
+            echo "Attempt $attempt failed with curl exit code $curl_exit. Retrying in 5s..."
             sleep 5
           done
 

@@ -51,11 +51,23 @@ jobs:
       - name: Parse comment
         id: parse
         shell: bash
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           set -euo pipefail
 
-          body='${{ github.event.comment.body }}'
-          normalized=$(printf '%s' "$body" | tr '[:upper:]' '[:lower:]' | xargs)
+          # Normalize the comment body:
+          # - convert to lowercase
+          # - remove carriage returns
+          # - trim leading/trailing whitespace
+          # - remove wrapping backticks if user typed `jenkins test poc`
+          normalized=$(printf '%s' "$COMMENT_BODY" \
+            | tr '[:upper:]' '[:lower:]' \
+            | tr -d '\r' \
+            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+            | sed 's/^`//;s/`$//')
+
+          echo "normalized_comment=$normalized"
 
           if [[ "$normalized" == "jenkins test poc" ]]; then
             echo "trigger_poc=true" >> "$GITHUB_OUTPUT"
@@ -121,7 +133,7 @@ jobs:
             echo "commenter_is_ceph_member=false" >> "$GITHUB_OUTPUT"
             echo "Membership check response body:"
             cat "$response_file" || true
-          fi    
+          fi
 
       - name: Resolve PR metadata
         id: pr
@@ -174,7 +186,7 @@ jobs:
           needs.parse-comment.outputs.ok_to_test == 'true' &&
           needs.parse-comment.outputs.commenter_is_ceph_member == 'true'
         )
-      )         
+      )
     uses: ./.github/workflows/dispatch-jenkins-job.yml
     secrets: inherit
     with:
