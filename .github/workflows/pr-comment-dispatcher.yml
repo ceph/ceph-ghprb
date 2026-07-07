@@ -96,17 +96,32 @@ jobs:
           set -euo pipefail
 
           user='${{ github.event.comment.user.login }}'
+          response_file=$(mktemp)
 
-          status=$(curl -s -o /dev/null -w "%{http_code}" \
+          status=$(curl -sS -o "$response_file" -w "%{http_code}" \
             -H "Authorization: Bearer ${{ secrets.CEPH_ORG_READ_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/orgs/ceph/members/$user")
+            "https://api.github.com/orgs/ceph/memberships/$user")
 
-          if [[ "$status" == "204" ]]; then
-            echo "commenter_is_ceph_member=true" >> "$GITHUB_OUTPUT"
+          echo "membership_check_http_status=$status"
+
+          if [[ "$status" == "200" ]]; then
+            state=$(jq -r '.state // empty' "$response_file")
+            role=$(jq -r '.role // empty' "$response_file")
+
+            echo "membership_state=$state"
+            echo "membership_role=$role"
+
+            if [[ "$state" == "active" ]]; then
+              echo "commenter_is_ceph_member=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "commenter_is_ceph_member=false" >> "$GITHUB_OUTPUT"
+            fi
           else
             echo "commenter_is_ceph_member=false" >> "$GITHUB_OUTPUT"
-          fi
+            echo "Membership check response body:"
+            cat "$response_file" || true
+          fi    
 
       - name: Resolve PR metadata
         id: pr
@@ -149,14 +164,17 @@ jobs:
       needs.parse-comment.outputs.skip_ci != 'true' &&
       (
         (
-          needs.parse-comment.outputs.authorized == 'true' &&
-          needs.parse-comment.outputs.trigger_poc == 'true'
+          needs.parse-comment.outputs.trigger_poc == 'true' &&
+          (
+            needs.parse-comment.outputs.authorized == 'true' ||
+            needs.parse-comment.outputs.commenter_is_ceph_member == 'true'
+          )
         ) ||
         (
-          needs.parse-comment.outputs.commenter_is_ceph_member == 'true' &&
-          needs.parse-comment.outputs.ok_to_test == 'true'
+          needs.parse-comment.outputs.ok_to_test == 'true' &&
+          needs.parse-comment.outputs.commenter_is_ceph_member == 'true'
         )
-      )
+      )         
     uses: ./.github/workflows/dispatch-jenkins-job.yml
     secrets: inherit
     with:
