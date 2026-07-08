@@ -109,7 +109,7 @@ jobs:
     steps:
       - name: Add non-member CI notice comment
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PR_COMMENT_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ needs.pr-info.outputs.pr_number }}
         shell: bash
@@ -118,28 +118,55 @@ jobs:
 
           marker="<!-- ceph-ci-non-member-notice -->"
 
-          existing=$(curl -sS \
+          echo "Checking existing PR comments for PR #$PR_NUMBER in $REPO"
+
+          comments_response=$(mktemp)
+
+          comments_http_code=$(curl -sS -o "$comments_response" -w "%{http_code}" -L \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
-            | jq -r '.[].body')
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100")
 
-          if echo "$existing" | grep -q "$marker"; then
+          echo "comments_list_http_status=$comments_http_code"
+
+          if [[ "$comments_http_code" -lt 200 || "$comments_http_code" -ge 300 ]]; then
+            echo "Failed to list existing PR comments. Response body:"
+            cat "$comments_response" || true
+            exit 1
+          fi
+
+          if ! jq -e 'type == "array"' "$comments_response" >/dev/null; then
+            echo "Unexpected response while listing comments. Expected JSON array. Response body:"
+            cat "$comments_response" || true
+            exit 1
+          fi
+
+          if jq -r '.[].body // empty' "$comments_response" | grep -q "$marker"; then
             echo "Non-member CI notice already exists. Skipping duplicate comment."
             exit 0
           fi
 
           body=$(jq -n \
             --arg marker "$marker" \
-            --arg text 'Thank you for your contribution. Since you, the author, are not a member of the Ceph GitHub Org yet, our CI will not automatically run. Any member of the Ceph Org may comment "ok to test" to allow the Jenkins jobs to run.' \
+            --arg text 'Thank you for your contribution.  Since you, the author, are not a member of the Ceph GitHub Org yet, our CI will not automatically run.  Any member of the Ceph Org may comment "ok  - to - test" (without the dashes) to allow the Jenkins jobs to run.' \
             '{body: ($text + "\n\n" + $marker)}')
 
-          curl --fail -L \
+          echo "Posting non-member CI notice comment..."
+
+          post_response=$(mktemp)
+
+          post_http_code=$(curl -sS -o "$post_response" -w "%{http_code}" -L \
             -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
-            -d "$body"
+            -d "$body")
+
+          echo "comment_create_http_status=$post_http_code"
+          echo "Comment create response body:"
+          cat "$post_response" || true
+
+          test "$post_http_code" -ge 200 -a "$post_http_code" -lt 300        
 
   trigger-poc:
     needs: pr-info
